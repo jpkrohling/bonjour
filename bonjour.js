@@ -15,9 +15,32 @@
  * limitations under the License.
  */
 
-var express = require('express');
+// zipkin-related
+const express = require('express');
+const {Tracer, ExplicitContext, BatchRecorder} = require('zipkin');
+const zipkinMiddleware = require('zipkin-instrumentation-express').expressMiddleware;
+
+const ctxImpl = new ExplicitContext();
+const {HttpLogger} = require('zipkin-transport-http');
+
+const recorder = new BatchRecorder({
+	logger: new HttpLogger({
+		endpoint: 'http://zipkin-query:9411/api/v1/spans'
+	})
+});
+
+const tracer = new Tracer({
+	recorder,
+	ctxImpl // this would typically be a CLSContext or ExplicitContext
+});
+	
 var os = require('os');
 var app = express();
+
+app.use(zipkinMiddleware({
+	tracer,
+	serviceName: 'bonjour-service' // name of this application
+}));
 
 function say_bonjour(){
     return "Bonjour de " + os.hostname();
