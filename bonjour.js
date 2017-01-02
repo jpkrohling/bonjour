@@ -20,8 +20,8 @@ const express = require('express');
 const fs = require('fs');
 const session = require('express-session');
 const Keycloak = require('keycloak-connect');
-const {Tracer, ExplicitContext, BatchRecorder, ConsoleRecorder} = require('zipkin');
-const zipkinMiddleware = require('zipkin-instrumentation-express').expressMiddleware;
+const opentracing = require('opentracing');
+const hawkularAPM = require('hawkular-apm-opentracing');
 
 // chaining
 const roi = require('roi');
@@ -33,50 +33,33 @@ const circuitOptions = {
   timeout: 1000,
   resetTimeout: 10000
 };
+
 const nextService = 'ola';
+const nextServiceBaseUrl = process.env.OLA_SERVER_URL ? process.env.OLA_SERVER_URL : `http://${process.env.OLA_SERVICE_HOST}:${process.env.OLA_SERVICE_PORT}`;
 const circuit = circuitBreaker(roi.get, circuitOptions);
 circuit.fallback(() => (`The ${nextService} service is currently unavailable.`));
 
 const chainingOptions = {
-  endpoint: `http://${nextService}:8080/api/${nextService}-chaining`
+  endpoint: `${nextServiceBaseUrl}/api/${nextService}-chaining`
 };
 
-const ctxImpl = new ExplicitContext();
-const {HttpLogger} = require('zipkin-transport-http');
 const os = require('os');
 const app = express();
-
-let recorder;
-if (process.env.ZIPKIN_SERVER_URL === undefined) {
-  console.log('No ZIPKIN_SERVER_URL defined. Printing zipkin traces to console.');
-  recorder = new ConsoleRecorder();
-} else {
-  recorder = new BatchRecorder({
-    logger: new HttpLogger({
-      endpoint: process.env.ZIPKIN_SERVER_URL + '/api/v1/spans'
-    })
-  });
-}
-
-const tracer = new Tracer({
-  recorder,
-  ctxImpl // this would typically be a CLSContext or ExplicitContext
-});
 
 // Create a session-store to be used by both the express-session
 // middleware and the keycloak middleware.
 const memoryStore = new session.MemoryStore();
+
+opentracing.initGlobalTracer(new hawkularAPM.APMTracer({
+    recorder: new hawkularAPM.HttpRecorder(process.env.HAWKULAR_APM_URI, process.env.HAWKULAR_APM_USERNAME, process.env.HAWKULAR_APM_PASSWORD),
+    sampler: new hawkularAPM.AlwaysSample(),
+}));
 
 app.use(session({
   secret: 'mySecret',
   resave: false,
   saveUninitialized: true,
   store: memoryStore
-}));
-
-app.use(zipkinMiddleware({
-  tracer,
-  serviceName: 'bonjour' // name of this application
 }));
 
 // Configure keycloak based on keycloak.json and the KEYCLOAK_AUTH_SERVER_URL env var
@@ -91,6 +74,27 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   next();
+});
+
+app.use((req, res, next) => {
+    Object.keys(req.headers).forEach((key) => {
+        console.log("Received {%s} header with {%s} value", key, req.headers[key]);
+    });
+    next();
+});
+
+app.use((req, res, next) => {
+    const serverSpan = opentracing.globalTracer().startSpan("GET", {
+        childOf: extractSpanContext(opentracing.globalTracer(), req.headers),
+        tags: {
+            'http.method': req.method,
+            'http.url': extractUrl(req),
+        }
+    });
+
+    next();
+    serverSpan.setTag('http.status_code', res.statusCode);
+    serverSpan.finish();
 });
 
 app.get('/', (req, res) => res.send('Logged out'));
@@ -114,9 +118,17 @@ app.get('/api/health', (req, resp) => {
   resp.send('I am ok');
 });
 
-const server = app.listen(8080, '0.0.0.0', () => {
+const server = app.listen(8180, '0.0.0.0', () => {
   const host = server.address().address;
   const port = server.address().port;
 
   console.log('Bonjour service running at http://%s:%s', host, port);
 });
+
+function extractSpanContext(tracer, httpHeaders) {
+    return tracer.extract(opentracing.FORMAT_TEXT_MAP, httpHeaders);
+}
+
+function extractUrl(request) {
+    return 'http://' + request.headers.host + request.url;
+}
